@@ -1,14 +1,22 @@
+```php
 <?php
 declare(strict_types=1);
 
 require_once __DIR__ . '/../html/api/db.php';
 
 date_default_timezone_set('Asia/Shanghai');
+
 initDatabase();
 
 const GEO_CACHE_FILE = '/opt/SubMonitor/rules/ip_cache.json';
+const GEO_BATCH_SIZE = 100;
+const GEO_SLEEP_SECONDS = 5;
 
-function isPublicIp(string $ip): bool {
+/**
+ * 判断是否为公网 IP
+ */
+function isPublicIp(string $ip): bool
+{
     return filter_var(
         $ip,
         FILTER_VALIDATE_IP,
@@ -17,12 +25,35 @@ function isPublicIp(string $ip): bool {
 }
 
 /**
+ * 判断 IP 是否为有效 IP
+ */
+function isValidIp(string $ip): bool
+{
+    return filter_var($ip, FILTER_VALIDATE_IP) !== false;
+}
+
+/**
+ * 非公网 IP 的说明
+ */
+function classifyNonPublicIp(string $ip): string
+{
+    if ($ip === '127.0.0.1' || $ip === '::1') {
+        return '本机地址';
+    }
+
+    return '非公网地址';
+}
+
+/**
  * 查询 IP 归属地
  */
-function queryGeo(string $ip): string {
+function queryGeo(string $ip): string
+{
     $url = 'http://ip-api.com/json/' .
         rawurlencode($ip) .
         '?lang=zh-CN&fields=status,message,country,regionName,city,isp,org';
+
+    $body = false;
 
     if (function_exists('curl_init')) {
         $ch = curl_init($url);
@@ -39,6 +70,7 @@ function queryGeo(string $ip): string {
         ]);
 
         $body = curl_exec($ch);
+
         curl_close($ch);
     } else {
         $ctx = stream_context_create([
@@ -74,7 +106,9 @@ function queryGeo(string $ip): string {
         !empty($data['isp'])
             ? '(' . $data['isp'] . ')'
             : '',
-    ], static fn($v) => trim((string)$v) !== '');
+    ], static fn($value): bool =>
+        trim((string)$value) !== ''
+    );
 
     return trim(implode(' ', $parts));
 }
@@ -82,7 +116,8 @@ function queryGeo(string $ip): string {
 /**
  * 读取 IP JSON 缓存
  */
-function loadGeoCache(): array {
+function loadGeoCache(): array
+{
     if (!is_file(GEO_CACHE_FILE)) {
         return [];
     }
@@ -101,13 +136,15 @@ function loadGeoCache(): array {
 /**
  * 写入 IP JSON 缓存
  *
- * 使用临时文件 + rename，避免直接写 JSON 时进程中断导致文件损坏。
+ * 使用临时文件 + rename，
+ * 避免直接写入 JSON 时进程中断导致文件损坏。
  */
-function saveGeoCache(array $cache): void {
+function saveGeoCache(array $cache): bool
+{
     $dir = dirname(GEO_CACHE_FILE);
 
     if (!is_dir($dir)) {
-        return;
+        return false;
     }
 
     $json = json_encode(
@@ -118,17 +155,41 @@ function saveGeoCache(array $cache): void {
     );
 
     if ($json === false) {
-        return;
+        error_log(
+            '[SubMonitor geo] Failed to encode geo cache: ' .
+            json_last_error_msg()
+        );
+
+        return false;
     }
 
     $tmpFile = GEO_CACHE_FILE . '.tmp';
 
-    if (@file_put_contents($tmpFile, $json, LOCK_EX) === false) {
-        error_log('[SubMonitor geo] Failed to write geo cache');
-        return;
+    if (
+        @file_put_contents(
+            $tmpFile,
+            $json,
+            LOCK_EX
+        ) === false
+    ) {
+        error_log(
+            '[SubMonitor geo] Failed to write geo cache'
+        );
+
+        return false;
     }
 
-    @rename($tmpFile, GEO_CACHE_FILE);
+    if (!@rename($tmpFile, GEO_CACHE_FILE)) {
+        @unlink($tmpFile);
+
+        error_log(
+            '[SubMonitor geo] Failed to replace geo cache'
+        );
+
+        return false;
+    }
+
+    return true;
 }
 
 /**
@@ -147,9 +208,29 @@ function saveGeoToDatabase(
             updated_at=excluded.updated_at'
     );
 
-    $stmt->bindValue(':ip', $ip, SQLITE3_TEXT);
-    $stmt->bindValue(':info', $info, SQLITE3_TEXT);
-    $stmt->bindValue(':now', $now, SQLITE3_INTEGER);
+    if ($stmt === false) {
+        throw new RuntimeException(
+            'Failed to prepare SQLite statement'
+        );
+    }
+
+    $stmt->bindValue(
+        ':ip',
+        $ip,
+        SQLITE3_TEXT
+    );
+
+    $stmt->bindValue(
+        ':info',
+        $info,
+        SQLITE3_TEXT
+    );
+
+    $stmt->bindValue(
+        ':now',
+        $now,
+        SQLITE3_INTEGER
+    );
 
     $result = $stmt->execute();
 
@@ -160,45 +241,87 @@ function saveGeoToDatabase(
     }
 }
 
+/**
+ * 获取待处理 IP
+ *
+ * 使用 DISTINCT，避免同一个 IP 因为存在多条日志而重复出现。
+ */
+function getPendingIps(): array
+{
+    $rows = [];
+
+    $result = db()->query(
+        "SELECT DISTINCT l.ip
+         FROM logs l
+         LEFT JOIN ip_info i ON i.ip = l.ip
+         WHERE i.ip IS NULL
+           AND l.ip <> '-'
+         LIMIT " . GEO_BATCH_SIZE
+    );
+
+    if ($result === false) {
+        return [];
+    }
+
+    while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+        $ip = trim((string)($row['ip'] ?? ''));
+
+        if ($ip === '') {
+            continue;
+        }
+
+        if (!isValidIp($ip)) {
+            continue;
+        }
+
+        $rows[] = $ip;
+    }
+
+    return array_values(array_unique($rows));
+}
+
+/**
+ * 主循环
+ */
 while (true) {
     try {
         $now = time();
 
-        /*
-         * 每轮加载一次 JSON 缓存。
-         */
         $cache = loadGeoCache();
 
-        /*
-         * 找出 logs 中还没有进入 ip_info 的公网 IP。
-         */
-        $rows = [];
+        $pendingIps = getPendingIps();
 
-        $result = db()->query(
-            "SELECT l.ip
-             FROM logs l
-             LEFT JOIN ip_info i ON i.ip=l.ip
-             WHERE i.ip IS NULL
-               AND l.ip <> '-'
-             LIMIT 20"
-        );
-
-        if ($result) {
-            while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
-                $ip = trim((string)($row['ip'] ?? ''));
-
-                if ($ip !== '' && isPublicIp($ip)) {
-                    $rows[] = $ip;
-                }
-            }
+        if (empty($pendingIps)) {
+            sleep(GEO_SLEEP_SECONDS);
+            continue;
         }
 
-        $rows = array_values(array_unique($rows));
+        $cacheChanged = false;
 
-        foreach ($rows as $ip) {
+        foreach ($pendingIps as $ip) {
 
             /*
-             * ① 优先读取 JSON 缓存
+             * 非公网 IP：
+             *
+             * 不需要调用第三方 Geo API。
+             * 直接写入 SQLite，避免每轮重复处理。
+             */
+            if (!isPublicIp($ip)) {
+                $info = classifyNonPublicIp($ip);
+
+                saveGeoToDatabase(
+                    $ip,
+                    $info,
+                    $now
+                );
+
+                echo "[Geo] Non-public -> DB: {$ip} => {$info}\n";
+
+                continue;
+            }
+
+            /*
+             * 优先使用 JSON 缓存。
              */
             if (
                 array_key_exists($ip, $cache) &&
@@ -207,7 +330,11 @@ while (true) {
             ) {
                 $info = trim($cache[$ip]);
 
-                saveGeoToDatabase($ip, $info, $now);
+                saveGeoToDatabase(
+                    $ip,
+                    $info,
+                    $now
+                );
 
                 echo "[Geo] Cache -> DB: {$ip} => {$info}\n";
 
@@ -215,42 +342,49 @@ while (true) {
             }
 
             /*
-             * ② JSON 没有，才请求 API
+             * JSON 没有缓存，查询 API。
              */
             $info = queryGeo($ip);
 
-            /*
-             * 查询失败：
-             * 不写入 ip_info，下一轮继续尝试。
-             */
             if ($info === '') {
                 echo "[Geo] Query failed: {$ip}\n";
                 continue;
             }
 
             /*
-             * ③ 写入 JSON 缓存
+             * API 查询成功：
+             *
+             * 1. 写 JSON 缓存
+             * 2. 写 SQLite
              */
             $cache[$ip] = $info;
+            $cacheChanged = true;
 
-            /*
-             * ④ 写入 SQLite
-             */
-            saveGeoToDatabase($ip, $info, $now);
+            saveGeoToDatabase(
+                $ip,
+                $info,
+                $now
+            );
 
             echo "[Geo] API -> Cache + DB: {$ip} => {$info}\n";
         }
 
         /*
-         * 只有缓存发生变化时才写文件。
+         * 只有 API 真正产生新缓存时，
+         * 才重新写入 ip_cache.json。
          */
-        if (!empty($rows)) {
-            saveGeoCache($cache);
+        if ($cacheChanged) {
+            if (saveGeoCache($cache)) {
+                echo "[Geo] Cache file updated.\n";
+            }
         }
 
     } catch (Throwable $e) {
-        error_log('[SubMonitor geo] ' . $e->getMessage());
+        error_log(
+            '[SubMonitor geo] ' . $e->getMessage()
+        );
     }
 
-    sleep(5);
+    sleep(GEO_SLEEP_SECONDS);
 }
+```
