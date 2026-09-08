@@ -50,6 +50,17 @@ services:
         chown 82:82 "$$RULES_DIR"
         chmod 775 "$$RULES_DIR"
 
+        # The ACME working directory contains account/private material and is
+        # intentionally prepared as root-only. Nginx creates and owns it.
+        mkdir -p "$$RULES_DIR/acme"
+        chown root:root "$$RULES_DIR/acme"
+        chmod 700 "$$RULES_DIR/acme"
+
+        # Certificate directory is writable by the Nginx/root process and
+        # readable by the PHP container through its read-only mount.
+        mkdir -p /opt/SubMonitor/ssl
+        chmod 755 /opt/SubMonitor/ssl
+
         echo "[Init] Permissions initialized: PHP runtime UID/GID 82:82"
 
 
@@ -175,7 +186,11 @@ services:
   # Nginx
   # ---------------------------------------------------------
   nginx:
-    image: nginx:alpine
+    build:
+      context: .
+      dockerfile: nginx/Dockerfile
+
+    image: submonitor-nginx:latest
     container_name: submonitor-nginx
     restart: always
 
