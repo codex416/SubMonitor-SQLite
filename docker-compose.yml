@@ -1,6 +1,6 @@
 services:
   # ---------------------------------------------------------
-  # Initialize SQLite data directory and Geo cache permissions
+  # Initialize persistent directory permissions
   # ---------------------------------------------------------
   init-data:
     image: alpine:latest
@@ -10,6 +10,8 @@ services:
     volumes:
       - ./data:/opt/SubMonitor/data
       - ./rules:/opt/SubMonitor/rules
+      - ./html:/opt/SubMonitor/html
+      - ./nginx:/opt/SubMonitor/nginx
 
     command:
       - sh
@@ -19,41 +21,36 @@ services:
 
         DATA_DIR="/opt/SubMonitor/data"
         RULES_DIR="/opt/SubMonitor/rules"
+        HTML_DIR="/opt/SubMonitor/html"
+        NGINX_DIR="/opt/SubMonitor/nginx"
         CACHE_FILE="$$RULES_DIR/ip_cache.json"
 
-        echo "[Init] Preparing SQLite data directory..."
+        echo "[Init] Preparing persistent directory permissions..."
 
-        mkdir -p "$$DATA_DIR"
+        # PHP-FPM、importer、geo-worker all run as UID/GID 82.
+        # These directories are intentionally writable by UID/GID 82.
+        for dir in "$$DATA_DIR" "$$RULES_DIR" "$$HTML_DIR" "$$NGINX_DIR"; do
+          mkdir -p "$$dir"
+          chown -R 82:82 "$$dir"
+          find "$$dir" -type d -exec chmod 775 {} \;
+          find "$$dir" -type f -exec chmod 664 {} \;
+        done
 
-        chown -R 82:82 "$$DATA_DIR"
-
-        find "$$DATA_DIR" -type d -exec chmod 775 {} \;
-
+        # SQLite database and WAL/SHM files must remain writable by PHP.
         find "$$DATA_DIR" -type f \
-          \( \
-            -name "*.db" \
-            -o -name "*.db-wal" \
-            -o -name "*.db-shm" \
-          \) \
+          \( -name "*.db" -o -name "*.db-wal" -o -name "*.db-shm" \) \
+          -exec chown 82:82 {} \; \
           -exec chmod 664 {} \;
 
-        echo "[Init] Preparing Geo cache..."
-
+        # Geo cache is also written by the PHP worker.
         mkdir -p "$$RULES_DIR"
-
-        if [ -f "$$CACHE_FILE" ]; then
-          chown 82:82 "$$CACHE_FILE"
-          chmod 664 "$$CACHE_FILE"
-        else
-          touch "$$CACHE_FILE"
-          chown 82:82 "$$CACHE_FILE"
-          chmod 664 "$$CACHE_FILE"
-        fi
-
+        touch "$$CACHE_FILE"
+        chown 82:82 "$$CACHE_FILE"
+        chmod 664 "$$CACHE_FILE"
         chown 82:82 "$$RULES_DIR"
         chmod 775 "$$RULES_DIR"
 
-        echo "[Init] SQLite and Geo cache permissions initialized."
+        echo "[Init] Permissions initialized: PHP runtime UID/GID 82:82"
 
 
   # ---------------------------------------------------------
@@ -61,11 +58,8 @@ services:
   # ---------------------------------------------------------
   ip-cache-sync:
     image: submonitor-php:latest
-
     container_name: submonitor-ip-cache-sync
-
     user: "82:82"
-
     restart: "no"
 
     depends_on:
@@ -79,7 +73,7 @@ services:
     volumes:
       - ./bin:/opt/SubMonitor/bin:ro
       - ./html:/opt/SubMonitor/html:ro
-      - ./rules:/opt/SubMonitor/rules:ro
+      - ./rules:/opt/SubMonitor/rules
       - ./data:/opt/SubMonitor/data
 
     networks:
@@ -95,11 +89,8 @@ services:
       dockerfile: Dockerfile
 
     image: submonitor-php:latest
-
     container_name: submonitor-php
-
     user: "82:82"
-
     restart: always
 
     depends_on:
@@ -107,20 +98,19 @@ services:
         condition: service_completed_successfully
 
     volumes:
-
-      # PHP需要修改密码
+      # PHP needs to update the admin password.
       - ./html:/opt/SubMonitor/html
 
-      # PHP需要修改nginx配置
+      # PHP needs to update the Nginx upstream configuration.
       - ./nginx:/etc/nginx/conf.d
 
-      # PHP需要写黑名单规则
+      # PHP workers update blacklist/domain state files.
       - ./rules:/opt/SubMonitor/rules
 
-      # PHP申请SSL需要写入证书
-      - ./ssl:/etc/nginx/ssl
+      # PHP only needs to read certificates; Nginx/ACME owns writes.
+      - ./ssl:/etc/nginx/ssl:ro
 
-      # SQLite
+      # SQLite database.
       - ./data:/opt/SubMonitor/data
 
     networks:
@@ -132,11 +122,8 @@ services:
   # ---------------------------------------------------------
   log-importer:
     image: submonitor-php:latest
-
     container_name: submonitor-log-importer
-
     user: "82:82"
-
     restart: always
 
     depends_on:
@@ -150,7 +137,7 @@ services:
     volumes:
       - ./bin:/opt/SubMonitor/bin:ro
       - ./html:/opt/SubMonitor/html:ro
-      - ./rules:/opt/SubMonitor/rules:ro
+      - ./rules:/opt/SubMonitor/rules
       - ./data:/opt/SubMonitor/data
 
     networks:
@@ -162,11 +149,8 @@ services:
   # ---------------------------------------------------------
   geo-worker:
     image: submonitor-php:latest
-
     container_name: submonitor-geo-worker
-
     user: "82:82"
-
     restart: always
 
     depends_on:
@@ -192,9 +176,7 @@ services:
   # ---------------------------------------------------------
   nginx:
     image: nginx:alpine
-
     container_name: submonitor-nginx
-
     restart: always
 
     ports:
@@ -202,10 +184,18 @@ services:
       - "443:443"
 
     volumes:
-      - ./html:/opt/SubMonitor/html:ro
+      # ACME HTTP-01 needs to write challenge files into the webroot.
+      - ./html:/opt/SubMonitor/html
+
+      # PHP and Nginx share the same configuration files.
       - ./nginx:/etc/nginx/conf.d
+
+      # Nginx writes access/error logs and runtime rule state here.
       - ./rules:/opt/SubMonitor/rules
+
+      # Only Nginx/ACME writes certificates and private keys.
       - ./ssl:/etc/nginx/ssl
+
       - ./entrypoint.sh:/entrypoint.sh:ro
       - log-data:/var/log/nginx
 
