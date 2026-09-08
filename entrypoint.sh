@@ -1,28 +1,53 @@
 #!/bin/sh
 
+set -eu
+
 RULES_DIR="/opt/SubMonitor/rules"
 SSL_DIR="/etc/nginx/ssl"
-ACME_HOME="/opt/SubMonitor/rules/acme"
+ACME_HOME="$RULES_DIR/acme"
 DOMAIN_FILE="$RULES_DIR/domain.conf"
 LOCK_FILE="$RULES_DIR/.domain_locked"
 ALLOW_FILE="$RULES_DIR/domain_allow.conf"
 
+# UID/GID 82 is the PHP runtime user. Runtime state files created by Nginx
+# are handed back to UID/GID 82 so PHP can update them without 777 permissions.
+APP_UID=82
+APP_GID=82
+
 mkdir -p /etc/nginx/conf.d "$RULES_DIR" "$SSL_DIR" "$ACME_HOME"
 
-touch "$RULES_DIR/ip_blacklist.conf" "$RULES_DIR/ua_blacklist.conf" "$RULES_DIR/token_blacklist.conf"
-# Nginx 启动前必须存在，否则 include 会导致启动失败。
-touch "$ALLOW_FILE"
+# Nginx must have these include files before its first configuration test.
+touch \
+  "$RULES_DIR/ip_blacklist.conf" \
+  "$RULES_DIR/ua_blacklist.conf" \
+  "$RULES_DIR/token_blacklist.conf" \
+  "$ALLOW_FILE"
 
-# 生产环境权限：
-# 目录 755，普通配置文件 644，ACME 目录 700。
-chmod 755 "$RULES_DIR" /etc/nginx/conf.d "$SSL_DIR"
+# Keep the shared rules directory writable by PHP (82) and readable/writable by
+# the Nginx root process. Do not use 777.
+chown "$APP_UID:$APP_GID" "$RULES_DIR"
+chmod 775 "$RULES_DIR"
+
+# Normal shared rule/state files are group-writable and owned by the PHP user.
+for file in \
+  "$RULES_DIR/ip_blacklist.conf" \
+  "$RULES_DIR/ua_blacklist.conf" \
+  "$RULES_DIR/token_blacklist.conf" \
+  "$ALLOW_FILE"; do
+  chown "$APP_UID:$APP_GID" "$file"
+  chmod 664 "$file"
+done
+
+# ACME working data contains account/private material and must not be exposed to PHP.
+chown root:root "$ACME_HOME"
 chmod 700 "$ACME_HOME"
-chmod 644 "$RULES_DIR"/*.conf "$RULES_DIR"/*.json "$ALLOW_FILE" 2>/dev/null || true
 
-echo "[Init] 正在安装依赖..."
-apk add --no-cache curl openssl socat >/dev/null 2>&1
+# Production SSL permissions. The Nginx container is root, while PHP receives
+# the SSL directory read-only from docker-compose.
+chmod 755 "$SSL_DIR"
 
-# 初始安装使用临时自签名证书；正式 ACME 证书成功后会覆盖它。
+# Initial installation uses a temporary self-signed certificate; a successful
+# ACME certificate will replace it.
 if [ ! -s "$SSL_DIR/cert.pem" ] || [ ! -s "$SSL_DIR/key.pem" ]; then
   openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
     -keyout "$SSL_DIR/key.pem" -out "$SSL_DIR/cert.pem" \
@@ -30,15 +55,14 @@ if [ ! -s "$SSL_DIR/cert.pem" ] || [ ! -s "$SSL_DIR/key.pem" ]; then
 
   chmod 600 "$SSL_DIR/key.pem"
   chmod 644 "$SSL_DIR/cert.pem"
-
   echo "[Init] 自签名证书已生成"
 else
-  # 已存在的证书也恢复正确权限
   chmod 600 "$SSL_DIR/key.pem" 2>/dev/null || true
   chmod 644 "$SSL_DIR/cert.pem" 2>/dev/null || true
 fi
 
-# acme.sh 放到 /opt/SubMonitor/rules，避免运行数据落到 /root。
+# acme.sh is stored under the persistent rules directory so it survives
+# container recreation. It is managed only by the Nginx/root process.
 if [ ! -f "$ACME_HOME/acme.sh" ]; then
   echo "[Init] 正在安装 acme.sh..."
   curl -s https://get.acme.sh | sh -s email=admin@qq.com --home "$ACME_HOME" >/dev/null 2>&1
@@ -50,35 +74,54 @@ if [ -f "$ACME" ]; then
   "$ACME" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
 fi
 
-# 生成 Nginx domain allow map。
+# Write a shared runtime file with permissions that allow PHP (82) to update it.
+write_app_file() {
+  file="$1"
+  content="$2"
+  printf '%s' "$content" > "$file"
+  chown "$APP_UID:$APP_GID" "$file"
+  chmod 664 "$file"
+}
+
+# Nginx include for the exact authorized domain.
 write_allow_file() {
   domain="$1"
   : > "$ALLOW_FILE"
   if [ -n "$domain" ]; then
-    # 精确 Host 匹配；同时允许该域名的大小写变体由 Nginx $host 规范化处理。
     printf '"%s" 1;\n' "$domain" > "$ALLOW_FILE"
   fi
-  chmod 644 "$ALLOW_FILE" 2>/dev/null || true
+  chown "$APP_UID:$APP_GID" "$ALLOW_FILE"
+  chmod 664 "$ALLOW_FILE"
 }
 
-# 判断当前证书是否为正式证书，并且 CN 与绑定域名一致。
+# Generate the Nginx map used to enable/disable domain-only access.
+write_lock_map() {
+  if [ -f "$LOCK_FILE" ]; then
+    write_app_file "$RULES_DIR/domain_lock.conf" 'map $host $domain_locked { default 1; }\n'
+  else
+    write_app_file "$RULES_DIR/domain_lock.conf" 'map $host $domain_locked { default 0; }\n'
+  fi
+}
+
+# Determine whether the persisted certificate is a formal ACME certificate for
+# the persisted domain. This allows the lock state to survive container restart.
 is_formal_cert_for_domain() {
   domain="$1"
   [ -n "$domain" ] || return 1
   [ -s "$SSL_DIR/cert.pem" ] || return 1
+
   subject=$(openssl x509 -in "$SSL_DIR/cert.pem" -noout -subject 2>/dev/null || true)
   issuer=$(openssl x509 -in "$SSL_DIR/cert.pem" -noout -issuer 2>/dev/null || true)
+
   printf '%s' "$subject" | grep -Eiq "CN[[:space:]]*=[[:space:]]*${domain}([, /]|$)" || return 1
-  # 排除默认 CN=localhost 自签名证书；正式证书应来自 ACME CA。
   printf '%s' "$issuer" | grep -Eiq 'Let.s Encrypt|ZeroSSL|Google Trust Services|Buypass' || return 1
   return 0
 }
 
-# 每次容器启动先根据持久化状态恢复访问模式。
-DOMAIN=$(cat "$DOMAIN_FILE" 2>/dev/null | tr -d '
- ' || true)
+# Restore access mode from persistent certificate/domain state.
+DOMAIN=$(cat "$DOMAIN_FILE" 2>/dev/null | tr -d '\n ' || true)
 if is_formal_cert_for_domain "$DOMAIN"; then
-  echo "1" > "$LOCK_FILE"
+  write_app_file "$LOCK_FILE" "1\n"
   write_allow_file "$DOMAIN"
   echo "[Init] 检测到正式证书：$DOMAIN，已恢复域名锁定模式"
 else
@@ -87,75 +130,68 @@ else
   echo "[Init] 当前未检测到有效正式证书，保持 IP 可访问模式"
 fi
 
-# 用 include 的方式把锁定状态变成 Nginx 变量；文件始终存在。
-write_lock_map() {
-  if [ -f "$LOCK_FILE" ]; then
-    echo 'map $host $domain_locked { default 1; }' > "$RULES_DIR/domain_lock.conf"
-  else
-    echo 'map $host $domain_locked { default 0; }' > "$RULES_DIR/domain_lock.conf"
-  fi
-  chmod 644 "$RULES_DIR/domain_lock.conf" 2>/dev/null || true
-}
 write_lock_map
 
-# 后台任务：证书申请 + 配置重载监听
+# Background task: certificate issuance/renewal and Nginx reloads.
 (
 while true; do
   if [ -f "$RULES_DIR/.cert_flag" ]; then
-    DOMAIN=$(cat "$RULES_DIR/.cert_flag" | tr -d '
- ')
+    DOMAIN=$(cat "$RULES_DIR/.cert_flag" | tr -d '\n ')
     rm -f "$RULES_DIR/.cert_flag"
 
     if [ -z "$DOMAIN" ]; then
-      echo '{"status":"error","msg":"域名为空，跳过申请"}' > "$RULES_DIR/cert_status.json"
-      chmod 644 "$RULES_DIR/cert_status.json"
+      write_app_file "$RULES_DIR/cert_status.json" '{"status":"error","msg":"域名为空，跳过申请"}\n'
       sleep 3
       continue
     fi
 
-    # 域名变更/申请期间先解除锁定，避免旧域名与新证书状态混在一起。
+    # Domain changes temporarily disable the lock until the new certificate
+    # has been successfully issued and verified.
     rm -f "$LOCK_FILE"
     write_allow_file ""
     write_lock_map
     nginx -s reload >/dev/null 2>&1 || true
 
     echo "[Cert] 开始申请域名证书：$DOMAIN"
-    echo "{\"status\":\"processing\",\"msg\":\"正在申请 $DOMAIN 证书，请稍候...\"}" > "$RULES_DIR/cert_status.json"
-    chmod 644 "$RULES_DIR/cert_status.json"
+    write_app_file "$RULES_DIR/cert_status.json" "{\"status\":\"processing\",\"msg\":\"正在申请 $DOMAIN 证书，请稍候...\"}\n"
 
-    "$ACME" --issue -d "$DOMAIN" -w /opt/SubMonitor/html \
-      --accountemail admin@qq.com --force --keylength 2048
+    if "$ACME" --issue -d "$DOMAIN" -w /opt/SubMonitor/html \
+      --accountemail admin@qq.com --force --keylength 2048; then
 
-    if [ $? -eq 0 ]; then
-      "$ACME" --install-cert -d "$DOMAIN" \
+      if "$ACME" --install-cert -d "$DOMAIN" \
         --key-file "$SSL_DIR/key.pem" \
         --fullchain-file "$SSL_DIR/cert.pem" \
-        --reloadcmd "nginx -s reload"
+        --reloadcmd "nginx -s reload"; then
 
-      if is_formal_cert_for_domain "$DOMAIN"; then
-        echo "$DOMAIN" > "$DOMAIN_FILE"
-        echo "1" > "$LOCK_FILE"
+        if is_formal_cert_for_domain "$DOMAIN"; then
+          printf '%s\n' "$DOMAIN" > "$DOMAIN_FILE"
+          chown "$APP_UID:$APP_GID" "$DOMAIN_FILE"
+          chmod 664 "$DOMAIN_FILE"
 
-        chmod 644 "$DOMAIN_FILE" "$LOCK_FILE"
+          write_app_file "$LOCK_FILE" "1\n"
+          write_allow_file "$DOMAIN"
+          write_lock_map
 
-        write_allow_file "$DOMAIN"
-        write_lock_map
+          chmod 600 "$SSL_DIR/key.pem" 2>/dev/null || true
+          chmod 644 "$SSL_DIR/cert.pem" 2>/dev/null || true
 
-        # 正式证书安装后恢复正确权限
-        chmod 600 "$SSL_DIR/key.pem" 2>/dev/null || true
-        chmod 644 "$SSL_DIR/cert.pem" 2>/dev/null || true
-
-        nginx -s reload >/dev/null 2>&1 || true
-        echo "[Cert] ✅ $DOMAIN 正式证书已生效，已切换为强制域名模式"
-        echo "{\"status\":\"success\",\"msg\":\"✅ $DOMAIN 证书申请成功，已自动生效；IP 与未绑定域名已禁止访问。\"}" > "$RULES_DIR/cert_status.json"
-        chmod 644 "$RULES_DIR/cert_status.json"
+          nginx -s reload >/dev/null 2>&1 || true
+          echo "[Cert] ✅ $DOMAIN 正式证书已生效，已切换为强制域名模式"
+          write_app_file "$RULES_DIR/cert_status.json" "{\"status\":\"success\",\"msg\":\"✅ $DOMAIN 证书申请成功，已自动生效；IP 与未绑定域名已禁止访问。\"}\n"
+        else
+          rm -f "$LOCK_FILE"
+          write_allow_file ""
+          write_lock_map
+          echo "[Cert] ❌ ACME 命令成功但证书校验失败，保持 IP 可访问"
+          write_app_file "$RULES_DIR/cert_status.json" '{"status":"error","msg":"证书已返回，但未检测到与绑定域名匹配的正式 CA 证书。"}\n'
+        fi
       else
         rm -f "$LOCK_FILE"
         write_allow_file ""
         write_lock_map
-        echo "[Cert] ❌ ACME 命令成功但证书校验失败，保持 IP 可访问"
-        echo '{"status":"error","msg":"证书已返回，但未检测到与绑定域名匹配的正式 CA 证书。"}' > "$RULES_DIR/cert_status.json"
-        chmod 644 "$RULES_DIR/cert_status.json"
+        nginx -s reload >/dev/null 2>&1 || true
+        echo "[Cert] ❌ 证书安装失败，保持 IP 可访问模式"
+        write_app_file "$RULES_DIR/cert_status.json" '{"status":"error","msg":"❌ 证书安装失败，保持 IP 可访问模式。"}\n'
       fi
     else
       rm -f "$LOCK_FILE"
@@ -163,8 +199,7 @@ while true; do
       write_lock_map
       nginx -s reload >/dev/null 2>&1 || true
       echo "[Cert] ❌ $DOMAIN 证书申请失败，保持 IP 可访问模式"
-      echo '{"status":"error","msg":"❌ 申请失败！请确认域名已解析到本机IP、80端口开放且未被 CDN/代理拦截。"}' > "$RULES_DIR/cert_status.json"
-      chmod 644 "$RULES_DIR/cert_status.json"
+      write_app_file "$RULES_DIR/cert_status.json" '{"status":"error","msg":"❌ 申请失败！请确认域名已解析到本机IP、80端口开放且未被 CDN/代理拦截。"}\n'
     fi
   fi
 
