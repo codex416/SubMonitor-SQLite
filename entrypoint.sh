@@ -16,19 +16,16 @@ APP_GID=82
 
 mkdir -p /etc/nginx/conf.d "$RULES_DIR" "$SSL_DIR" "$ACME_HOME"
 
-# Nginx must have these include files before its first configuration test.
 touch \
   "$RULES_DIR/ip_blacklist.conf" \
   "$RULES_DIR/ua_blacklist.conf" \
   "$RULES_DIR/token_blacklist.conf" \
   "$ALLOW_FILE"
 
-# Keep the shared rules directory writable by PHP (82) and readable/writable by
-# the Nginx root process. Do not use 777.
+# Shared rules/state directory: PHP (82) can write; Nginx runs as root and can read/write.
 chown "$APP_UID:$APP_GID" "$RULES_DIR"
 chmod 775 "$RULES_DIR"
 
-# Normal shared rule/state files are group-writable and owned by the PHP user.
 for file in \
   "$RULES_DIR/ip_blacklist.conf" \
   "$RULES_DIR/ua_blacklist.conf" \
@@ -38,12 +35,11 @@ for file in \
   chmod 664 "$file"
 done
 
-# ACME working data contains account/private material and must not be exposed to PHP.
+# ACME working data contains account/private material and is managed only by root.
 chown root:root "$ACME_HOME"
 chmod 700 "$ACME_HOME"
 
-# Production SSL permissions. The Nginx container is root, while PHP receives
-# the SSL directory read-only from docker-compose.
+# Nginx owns certificate writes. PHP sees ./ssl as read-only in docker-compose.
 chmod 755 "$SSL_DIR"
 
 # Initial installation uses a temporary self-signed certificate; a successful
@@ -75,15 +71,15 @@ if [ -f "$ACME" ]; then
 fi
 
 # Write a shared runtime file with permissions that allow PHP (82) to update it.
+# %b is used intentionally so callers can pass \n for a trailing newline.
 write_app_file() {
   file="$1"
   content="$2"
-  printf '%s' "$content" > "$file"
+  printf '%b' "$content" > "$file"
   chown "$APP_UID:$APP_GID" "$file"
   chmod 664 "$file"
 }
 
-# Nginx include for the exact authorized domain.
 write_allow_file() {
   domain="$1"
   : > "$ALLOW_FILE"
@@ -94,7 +90,6 @@ write_allow_file() {
   chmod 664 "$ALLOW_FILE"
 }
 
-# Generate the Nginx map used to enable/disable domain-only access.
 write_lock_map() {
   if [ -f "$LOCK_FILE" ]; then
     write_app_file "$RULES_DIR/domain_lock.conf" 'map $host $domain_locked { default 1; }\n'
@@ -103,8 +98,6 @@ write_lock_map() {
   fi
 }
 
-# Determine whether the persisted certificate is a formal ACME certificate for
-# the persisted domain. This allows the lock state to survive container restart.
 is_formal_cert_for_domain() {
   domain="$1"
   [ -n "$domain" ] || return 1
