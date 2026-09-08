@@ -1,4 +1,3 @@
-```php
 <?php
 declare(strict_types=1);
 
@@ -387,4 +386,3 @@ while (true) {
 
     sleep(GEO_SLEEP_SECONDS);
 }
-```
