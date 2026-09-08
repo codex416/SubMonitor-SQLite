@@ -1,113 +1,212 @@
 services:
+  # ---------------------------------------------------------
+  # Initialize SQLite data directory permissions
+  # www-data UID/GID in php:8.2-fpm-alpine = 82:82
+  # ---------------------------------------------------------
   init-data:
     image: alpine:latest
     container_name: submonitor-init-data
     restart: "no"
+
     volumes:
       - ./data:/opt/SubMonitor/data
+
     command:
       - sh
       - -c
       - |
-        mkdir -p /opt/SubMonitor/data
-        chmod 777 /opt/SubMonitor/data
-        if [ -f /opt/SubMonitor/data/submonitor.db ]; then
-          chmod 666 /opt/SubMonitor/data/submonitor.db
-        fi
-        if [ -f /opt/SubMonitor/data/submonitor.db-wal ]; then
-          chmod 666 /opt/SubMonitor/data/submonitor.db-wal
-        fi
-        if [ -f /opt/SubMonitor/data/submonitor.db-shm ]; then
-          chmod 666 /opt/SubMonitor/data/submonitor.db-shm
-        fi
+        set -eu
 
+        DATA_DIR="/opt/SubMonitor/data"
+
+        echo "[Init] Preparing SQLite data directory..."
+
+        mkdir -p "$DATA_DIR"
+
+        # Application user in php:8.2-fpm-alpine
+        chown -R 82:82 "$DATA_DIR"
+
+        # Directories: owner/group writable
+        find "$DATA_DIR" -type d -exec chmod 775 {} \;
+
+        # SQLite database and sidecar files
+        find "$DATA_DIR" -type f \
+          \( \
+            -name "*.db" \
+            -o -name "*.db-wal" \
+            -o -name "*.db-shm" \
+          \) \
+          -exec chmod 664 {} \;
+
+        echo "[Init] SQLite permissions initialized."
+
+  # ---------------------------------------------------------
+  # PHP-FPM
+  # ---------------------------------------------------------
   php:
     build:
       context: .
       dockerfile: Dockerfile
+
     container_name: submonitor-php
-    user: root
+
+    # www-data in php:8.2-fpm-alpine
+    user: "82:82"
+
     restart: always
+
     depends_on:
       init-data:
         condition: service_completed_successfully
+
     volumes:
-      - ./html:/opt/SubMonitor/html
-      - ./nginx:/etc/nginx/conf.d
-      - ./rules:/opt/SubMonitor/rules
-      - ./ssl:/etc/nginx/ssl
+      # Application source: read-only
+      - ./html:/opt/SubMonitor/html:ro
+
+      # Nginx configuration: read-only
+      - ./nginx:/etc/nginx/conf.d:ro
+
+      # Rules are read-only for PHP
+      - ./rules:/opt/SubMonitor/rules:ro
+
+      # SSL is read-only for PHP
+      - ./ssl:/etc/nginx/ssl:ro
+
+      # SQLite database: read/write
       - ./data:/opt/SubMonitor/data
+
     networks:
       - submonitor-net
 
+  # ---------------------------------------------------------
+  # Log importer
+  # ---------------------------------------------------------
   log-importer:
     build:
       context: .
       dockerfile: Dockerfile
+
     container_name: submonitor-log-importer
-    user: root
+
+    user: "82:82"
+
     restart: always
+
     depends_on:
       init-data:
         condition: service_completed_successfully
-    command: ["php", "/opt/SubMonitor/bin/log_importer.php"]
+
+    command:
+      - php
+      - /opt/SubMonitor/bin/log_importer.php
+
     volumes:
-      - ./bin:/opt/SubMonitor/bin
-      - ./html:/opt/SubMonitor/html
-      - ./rules:/opt/SubMonitor/rules
+      # Application source: read-only
+      - ./bin:/opt/SubMonitor/bin:ro
+      - ./html:/opt/SubMonitor/html:ro
+
+      # Rules are read-only
+      - ./rules:/opt/SubMonitor/rules:ro
+
+      # SQLite database: read/write
       - ./data:/opt/SubMonitor/data
+
     networks:
       - submonitor-net
 
+  # ---------------------------------------------------------
+  # Geo worker
+  # ---------------------------------------------------------
   geo-worker:
     build:
       context: .
       dockerfile: Dockerfile
+
     container_name: submonitor-geo-worker
-    user: root
+
+    user: "82:82"
+
     restart: always
+
     depends_on:
       init-data:
         condition: service_completed_successfully
-    command: ["php", "/opt/SubMonitor/bin/geo_worker.php"]
+
+    command:
+      - php
+      - /opt/SubMonitor/bin/geo_worker.php
+
     volumes:
-      - ./bin:/opt/SubMonitor/bin
-      - ./html:/opt/SubMonitor/html
-      - ./rules:/opt/SubMonitor/rules
+      # Application source: read-only
+      - ./bin:/opt/SubMonitor/bin:ro
+      - ./html:/opt/SubMonitor/html:ro
+
+      # Rules are read-only
+      - ./rules:/opt/SubMonitor/rules:ro
+
+      # SQLite database: read/write
       - ./data:/opt/SubMonitor/data
+
     networks:
       - submonitor-net
 
+  # ---------------------------------------------------------
+  # Nginx
+  # ---------------------------------------------------------
   nginx:
     image: nginx:alpine
+
     container_name: submonitor-nginx
+
     restart: always
+
     ports:
       - "80:80"
       - "443:443"
+
     volumes:
-      - ./html:/opt/SubMonitor/html
+      # Web files are read-only
+      - ./html:/opt/SubMonitor/html:ro
+
+      # Nginx configuration
       - ./nginx:/etc/nginx/conf.d
+
+      # Runtime rules / ACME state
       - ./rules:/opt/SubMonitor/rules
+
+      # SSL certificates
       - ./ssl:/etc/nginx/ssl
-      - ./entrypoint.sh:/entrypoint.sh
+
+      # Initialization script
+      - ./entrypoint.sh:/entrypoint.sh:ro
+
+      # Nginx logs
       - log-data:/var/log/nginx
+
     depends_on:
       - php
+
     networks:
       - submonitor-net
-    entrypoint:
-      - sh
-      - -c
-      - chmod +x /entrypoint.sh && chmod -R 777 /opt/SubMonitor/html /etc/nginx/conf.d /opt/SubMonitor/rules /etc/nginx/ssl && /entrypoint.sh
 
+    entrypoint:
+      - /bin/sh
+      - /entrypoint.sh
+
+  # ---------------------------------------------------------
+  # Persistent Nginx log volume
+  # ---------------------------------------------------------
 volumes:
   log-data:
 
+# -----------------------------------------------------------
+# Network
+# -----------------------------------------------------------
 networks:
   submonitor-net:
     driver: bridge
     enable_ipv6: true
+
     ipam:
       config:
         - subnet: 172.30.0.0/16
