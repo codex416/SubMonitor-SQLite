@@ -1,6 +1,6 @@
 services:
   # ---------------------------------------------------------
-  # Initialize SQLite data directory permissions
+  # Initialize SQLite data directory and Geo cache permissions
   # www-data UID/GID in php:8.2-fpm-alpine = 82:82
   # ---------------------------------------------------------
   init-data:
@@ -10,6 +10,7 @@ services:
 
     volumes:
       - ./data:/opt/SubMonitor/data
+      - ./rules:/opt/SubMonitor/rules
 
     command:
       - sh
@@ -18,6 +19,8 @@ services:
         set -eu
 
         DATA_DIR="/opt/SubMonitor/data"
+        RULES_DIR="/opt/SubMonitor/rules"
+        CACHE_FILE="$$RULES_DIR/ip_cache.json"
 
         echo "[Init] Preparing SQLite data directory..."
 
@@ -38,7 +41,26 @@ services:
           \) \
           -exec chmod 664 {} \;
 
-        echo "[Init] SQLite permissions initialized."
+        echo "[Init] Preparing Geo cache..."
+
+        mkdir -p "$$RULES_DIR"
+
+        # Geo worker runs as 82:82 and needs to update ip_cache.json
+        if [ -f "$$CACHE_FILE" ]; then
+          chown 82:82 "$$CACHE_FILE"
+          chmod 664 "$$CACHE_FILE"
+        else
+          touch "$$CACHE_FILE"
+          chown 82:82 "$$CACHE_FILE"
+          chmod 664 "$$CACHE_FILE"
+        fi
+
+        # geo_worker.php uses temporary file + rename()
+        # Therefore the directory itself must be writable.
+        chown 82:82 "$$RULES_DIR"
+        chmod 775 "$$RULES_DIR"
+
+        echo "[Init] SQLite and Geo cache permissions initialized."
 
   # ---------------------------------------------------------
   # Import existing IP geo cache into SQLite
