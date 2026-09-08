@@ -69,7 +69,7 @@ services:
       - ./nginx:/etc/nginx/conf.d:ro
 
       # Rules are read-only for PHP
-      - ./rules:/opt/SubMonitor/rules:ro
+      - ./rules:/opt/SubMonitor/rules
 
       # SSL is read-only for PHP
       - ./ssl:/etc/nginx/ssl:ro
