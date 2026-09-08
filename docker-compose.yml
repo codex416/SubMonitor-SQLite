@@ -1,7 +1,6 @@
 services:
   # ---------------------------------------------------------
   # Initialize SQLite data directory and Geo cache permissions
-  # www-data UID/GID in php:8.2-fpm-alpine = 82:82
   # ---------------------------------------------------------
   init-data:
     image: alpine:latest
@@ -26,13 +25,10 @@ services:
 
         mkdir -p "$$DATA_DIR"
 
-        # Application user in php:8.2-fpm-alpine
         chown -R 82:82 "$$DATA_DIR"
 
-        # Directories: owner/group writable
         find "$$DATA_DIR" -type d -exec chmod 775 {} \;
 
-        # SQLite database and sidecar files
         find "$$DATA_DIR" -type f \
           \( \
             -name "*.db" \
@@ -45,7 +41,6 @@ services:
 
         mkdir -p "$$RULES_DIR"
 
-        # Geo worker runs as 82:82 and needs to update ip_cache.json
         if [ -f "$$CACHE_FILE" ]; then
           chown 82:82 "$$CACHE_FILE"
           chmod 664 "$$CACHE_FILE"
@@ -55,16 +50,14 @@ services:
           chmod 664 "$$CACHE_FILE"
         fi
 
-        # geo_worker.php uses temporary file + rename()
-        # Therefore the directory itself must be writable.
         chown 82:82 "$$RULES_DIR"
         chmod 775 "$$RULES_DIR"
 
         echo "[Init] SQLite and Geo cache permissions initialized."
 
+
   # ---------------------------------------------------------
   # Import existing IP geo cache into SQLite
-  # ip_cache.json -> SQLite ip_info
   # ---------------------------------------------------------
   ip-cache-sync:
     image: submonitor-php:latest
@@ -84,20 +77,14 @@ services:
       - /opt/SubMonitor/bin/import_ip_cache.php
 
     volumes:
-      # Import script
       - ./bin:/opt/SubMonitor/bin:ro
-
-      # Database API
       - ./html:/opt/SubMonitor/html:ro
-
-      # Existing cache: read-only
       - ./rules:/opt/SubMonitor/rules:ro
-
-      # SQLite database: read/write
       - ./data:/opt/SubMonitor/data
 
     networks:
       - submonitor-net
+
 
   # ---------------------------------------------------------
   # PHP-FPM
@@ -111,7 +98,6 @@ services:
 
     container_name: submonitor-php
 
-    # www-data in php:8.2-fpm-alpine
     user: "82:82"
 
     restart: always
@@ -121,23 +107,25 @@ services:
         condition: service_completed_successfully
 
     volumes:
-      # Application source: read-only
-      - ./html:/opt/SubMonitor/html:ro
 
-      # Nginx configuration: read-only
-      - ./nginx:/etc/nginx/conf.d:ro
+      # PHP需要修改密码
+      - ./html:/opt/SubMonitor/html
 
-      # Rules are read-only for PHP
-      - ./rules:/opt/SubMonitor/rules:ro
+      # PHP需要修改nginx配置
+      - ./nginx:/etc/nginx/conf.d
 
-      # SSL is read-only for PHP
-      - ./ssl:/etc/nginx/ssl:ro
+      # PHP需要写黑名单规则
+      - ./rules:/opt/SubMonitor/rules
 
-      # SQLite database: read/write
+      # PHP申请SSL需要写入证书
+      - ./ssl:/etc/nginx/ssl
+
+      # SQLite
       - ./data:/opt/SubMonitor/data
 
     networks:
       - submonitor-net
+
 
   # ---------------------------------------------------------
   # Log importer
@@ -160,18 +148,14 @@ services:
       - /opt/SubMonitor/bin/log_importer.php
 
     volumes:
-      # Application source: read-only
       - ./bin:/opt/SubMonitor/bin:ro
       - ./html:/opt/SubMonitor/html:ro
-
-      # Rules are read-only
       - ./rules:/opt/SubMonitor/rules:ro
-
-      # SQLite database: read/write
       - ./data:/opt/SubMonitor/data
 
     networks:
       - submonitor-net
+
 
   # ---------------------------------------------------------
   # Geo worker
@@ -194,18 +178,14 @@ services:
       - /opt/SubMonitor/bin/geo_worker.php
 
     volumes:
-      # Application source: read-only
       - ./bin:/opt/SubMonitor/bin:ro
       - ./html:/opt/SubMonitor/html:ro
-
-      # Geo worker needs to update ip_cache.json
       - ./rules:/opt/SubMonitor/rules
-
-      # SQLite database: read/write
       - ./data:/opt/SubMonitor/data
 
     networks:
       - submonitor-net
+
 
   # ---------------------------------------------------------
   # Nginx
@@ -222,22 +202,11 @@ services:
       - "443:443"
 
     volumes:
-      # Web files are read-only
       - ./html:/opt/SubMonitor/html:ro
-
-      # Nginx configuration
       - ./nginx:/etc/nginx/conf.d
-
-      # Runtime rules / ACME state
       - ./rules:/opt/SubMonitor/rules
-
-      # SSL certificates
       - ./ssl:/etc/nginx/ssl
-
-      # Initialization script
       - ./entrypoint.sh:/entrypoint.sh:ro
-
-      # Nginx logs
       - log-data:/var/log/nginx
 
     depends_on:
@@ -250,15 +219,11 @@ services:
       - /bin/sh
       - /entrypoint.sh
 
-# -----------------------------------------------------------
-# Persistent Nginx log volume
-# -----------------------------------------------------------
+
 volumes:
   log-data:
 
-# -----------------------------------------------------------
-# Network
-# -----------------------------------------------------------
+
 networks:
   submonitor-net:
     driver: bridge
