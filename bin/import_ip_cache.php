@@ -28,6 +28,15 @@ if ($json === false) {
     exit(1);
 }
 
+/*
+ * Empty cache is normal on a fresh installation.
+ * Skip migration instead of treating an empty file as invalid JSON.
+ */
+if (trim($json) === '') {
+    echo "[Geo] ip_cache.json is empty, skipping.\n";
+    exit(0);
+}
+
 $cache = json_decode($json, true);
 
 if (!is_array($cache)) {
