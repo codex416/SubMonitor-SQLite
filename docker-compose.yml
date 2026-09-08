@@ -1,0 +1,114 @@
+services:
+  init-data:
+    image: alpine:latest
+    container_name: submonitor-init-data
+    restart: "no"
+    volumes:
+      - ./data:/opt/SubMonitor/data
+    command:
+      - sh
+      - -c
+      - |
+        mkdir -p /opt/SubMonitor/data
+        chmod 777 /opt/SubMonitor/data
+        if [ -f /opt/SubMonitor/data/submonitor.db ]; then
+          chmod 666 /opt/SubMonitor/data/submonitor.db
+        fi
+        if [ -f /opt/SubMonitor/data/submonitor.db-wal ]; then
+          chmod 666 /opt/SubMonitor/data/submonitor.db-wal
+        fi
+        if [ -f /opt/SubMonitor/data/submonitor.db-shm ]; then
+          chmod 666 /opt/SubMonitor/data/submonitor.db-shm
+        fi
+
+  php:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: submonitor-php
+    user: root
+    restart: always
+    depends_on:
+      init-data:
+        condition: service_completed_successfully
+    volumes:
+      - ./html:/opt/SubMonitor/html
+      - ./nginx:/etc/nginx/conf.d
+      - ./rules:/opt/SubMonitor/rules
+      - ./ssl:/etc/nginx/ssl
+      - ./data:/opt/SubMonitor/data
+    networks:
+      - submonitor-net
+
+  log-importer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: submonitor-log-importer
+    user: root
+    restart: always
+    depends_on:
+      init-data:
+        condition: service_completed_successfully
+    command: ["php", "/opt/SubMonitor/bin/log_importer.php"]
+    volumes:
+      - ./bin:/opt/SubMonitor/bin
+      - ./html:/opt/SubMonitor/html
+      - ./rules:/opt/SubMonitor/rules
+      - ./data:/opt/SubMonitor/data
+    networks:
+      - submonitor-net
+
+  geo-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: submonitor-geo-worker
+    user: root
+    restart: always
+    depends_on:
+      init-data:
+        condition: service_completed_successfully
+    command: ["php", "/opt/SubMonitor/bin/geo_worker.php"]
+    volumes:
+      - ./bin:/opt/SubMonitor/bin
+      - ./html:/opt/SubMonitor/html
+      - ./rules:/opt/SubMonitor/rules
+      - ./data:/opt/SubMonitor/data
+    networks:
+      - submonitor-net
+
+  nginx:
+    image: nginx:alpine
+    container_name: submonitor-nginx
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./html:/opt/SubMonitor/html
+      - ./nginx:/etc/nginx/conf.d
+      - ./rules:/opt/SubMonitor/rules
+      - ./ssl:/etc/nginx/ssl
+      - ./entrypoint.sh:/entrypoint.sh
+      - log-data:/var/log/nginx
+    depends_on:
+      - php
+    networks:
+      - submonitor-net
+    entrypoint:
+      - sh
+      - -c
+      - chmod +x /entrypoint.sh && chmod -R 777 /opt/SubMonitor/html /etc/nginx/conf.d /opt/SubMonitor/rules /etc/nginx/ssl && /entrypoint.sh
+
+volumes:
+  log-data:
+
+networks:
+  submonitor-net:
+    driver: bridge
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16
+        - subnet: 2001:db8:1::/64
