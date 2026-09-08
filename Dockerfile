@@ -1,7 +1,7 @@
 FROM php:8.2-fpm-alpine
 
 # SQLite runtime + PHP SQLite extensions
-RUN apk add --no-cache sqlite \
+RUN apk add --no-cache sqlite sqlite-dev \
     && docker-php-ext-install -j"$(getconf _NPROCESSORS_ONLN)" \
         pdo_sqlite \
         sqlite3 \
