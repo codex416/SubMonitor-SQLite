@@ -41,6 +41,43 @@ services:
         echo "[Init] SQLite permissions initialized."
 
   # ---------------------------------------------------------
+  # Import existing IP geo cache into SQLite
+  # ip_cache.json -> SQLite ip_info
+  # ---------------------------------------------------------
+  ip-cache-sync:
+    image: submonitor-php:latest
+
+    container_name: submonitor-ip-cache-sync
+
+    user: "82:82"
+
+    restart: "no"
+
+    depends_on:
+      init-data:
+        condition: service_completed_successfully
+
+    command:
+      - php
+      - /opt/SubMonitor/bin/import_ip_cache.php
+
+    volumes:
+      # Import script
+      - ./bin:/opt/SubMonitor/bin:ro
+
+      # Database API
+      - ./html:/opt/SubMonitor/html:ro
+
+      # Existing cache: read-only
+      - ./rules:/opt/SubMonitor/rules:ro
+
+      # SQLite database: read/write
+      - ./data:/opt/SubMonitor/data
+
+    networks:
+      - submonitor-net
+
+  # ---------------------------------------------------------
   # PHP-FPM
   # ---------------------------------------------------------
   php:
@@ -58,7 +95,7 @@ services:
     restart: always
 
     depends_on:
-      init-data:
+      ip-cache-sync:
         condition: service_completed_successfully
 
     volumes:
@@ -69,7 +106,7 @@ services:
       - ./nginx:/etc/nginx/conf.d:ro
 
       # Rules are read-only for PHP
-      - ./rules:/opt/SubMonitor/rules
+      - ./rules:/opt/SubMonitor/rules:ro
 
       # SSL is read-only for PHP
       - ./ssl:/etc/nginx/ssl:ro
@@ -93,7 +130,7 @@ services:
     restart: always
 
     depends_on:
-      init-data:
+      ip-cache-sync:
         condition: service_completed_successfully
 
     command:
@@ -127,7 +164,7 @@ services:
     restart: always
 
     depends_on:
-      init-data:
+      ip-cache-sync:
         condition: service_completed_successfully
 
     command:
@@ -139,8 +176,8 @@ services:
       - ./bin:/opt/SubMonitor/bin:ro
       - ./html:/opt/SubMonitor/html:ro
 
-      # Rules are read-only
-      - ./rules:/opt/SubMonitor/rules:ro
+      # Geo worker needs to update ip_cache.json
+      - ./rules:/opt/SubMonitor/rules
 
       # SQLite database: read/write
       - ./data:/opt/SubMonitor/data
