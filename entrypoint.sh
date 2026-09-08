@@ -13,8 +13,11 @@ touch "$RULES_DIR/ip_blacklist.conf" "$RULES_DIR/ua_blacklist.conf" "$RULES_DIR/
 # Nginx 启动前必须存在，否则 include 会导致启动失败。
 touch "$ALLOW_FILE"
 
-chmod -R 777 "$RULES_DIR" /etc/nginx/conf.d "$SSL_DIR" 2>/dev/null || true
-chmod 666 "$RULES_DIR"/*.conf "$RULES_DIR"/*.json "$ALLOW_FILE" 2>/dev/null || true
+# 生产环境权限：
+# 目录 755，普通配置文件 644，ACME 目录 700。
+chmod 755 "$RULES_DIR" /etc/nginx/conf.d "$SSL_DIR"
+chmod 700 "$ACME_HOME"
+chmod 644 "$RULES_DIR"/*.conf "$RULES_DIR"/*.json "$ALLOW_FILE" 2>/dev/null || true
 
 echo "[Init] 正在安装依赖..."
 apk add --no-cache curl openssl socat >/dev/null 2>&1
@@ -24,8 +27,15 @@ if [ ! -s "$SSL_DIR/cert.pem" ] || [ ! -s "$SSL_DIR/key.pem" ]; then
   openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
     -keyout "$SSL_DIR/key.pem" -out "$SSL_DIR/cert.pem" \
     -subj "/CN=localhost" >/dev/null 2>&1
-  chmod 666 "$SSL_DIR"/*.pem 2>/dev/null || true
+
+  chmod 600 "$SSL_DIR/key.pem"
+  chmod 644 "$SSL_DIR/cert.pem"
+
   echo "[Init] 自签名证书已生成"
+else
+  # 已存在的证书也恢复正确权限
+  chmod 600 "$SSL_DIR/key.pem" 2>/dev/null || true
+  chmod 644 "$SSL_DIR/cert.pem" 2>/dev/null || true
 fi
 
 # acme.sh 放到 /opt/SubMonitor/rules，避免运行数据落到 /root。
@@ -36,6 +46,7 @@ fi
 
 ACME="$ACME_HOME/acme.sh"
 if [ -f "$ACME" ]; then
+  chmod 700 "$ACME" 2>/dev/null || true
   "$ACME" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
 fi
 
@@ -47,7 +58,7 @@ write_allow_file() {
     # 精确 Host 匹配；同时允许该域名的大小写变体由 Nginx $host 规范化处理。
     printf '"%s" 1;\n' "$domain" > "$ALLOW_FILE"
   fi
-  chmod 666 "$ALLOW_FILE" 2>/dev/null || true
+  chmod 644 "$ALLOW_FILE" 2>/dev/null || true
 }
 
 # 判断当前证书是否为正式证书，并且 CN 与绑定域名一致。
@@ -83,7 +94,7 @@ write_lock_map() {
   else
     echo 'map $host $domain_locked { default 0; }' > "$RULES_DIR/domain_lock.conf"
   fi
-  chmod 666 "$RULES_DIR/domain_lock.conf" 2>/dev/null || true
+  chmod 644 "$RULES_DIR/domain_lock.conf" 2>/dev/null || true
 }
 write_lock_map
 
@@ -97,6 +108,7 @@ while true; do
 
     if [ -z "$DOMAIN" ]; then
       echo '{"status":"error","msg":"域名为空，跳过申请"}' > "$RULES_DIR/cert_status.json"
+      chmod 644 "$RULES_DIR/cert_status.json"
       sleep 3
       continue
     fi
@@ -108,7 +120,8 @@ while true; do
     nginx -s reload >/dev/null 2>&1 || true
 
     echo "[Cert] 开始申请域名证书：$DOMAIN"
-    echo "{"status":"processing","msg":"正在申请 $DOMAIN 证书，请稍候..."}" > "$RULES_DIR/cert_status.json"
+    echo "{\"status\":\"processing\",\"msg\":\"正在申请 $DOMAIN 证书，请稍候...\"}" > "$RULES_DIR/cert_status.json"
+    chmod 644 "$RULES_DIR/cert_status.json"
 
     "$ACME" --issue -d "$DOMAIN" -w /opt/SubMonitor/html \
       --accountemail admin@qq.com --force --keylength 2048
@@ -122,18 +135,27 @@ while true; do
       if is_formal_cert_for_domain "$DOMAIN"; then
         echo "$DOMAIN" > "$DOMAIN_FILE"
         echo "1" > "$LOCK_FILE"
+
+        chmod 644 "$DOMAIN_FILE" "$LOCK_FILE"
+
         write_allow_file "$DOMAIN"
         write_lock_map
-        chmod 666 "$SSL_DIR"/*.pem 2>/dev/null || true
+
+        # 正式证书安装后恢复正确权限
+        chmod 600 "$SSL_DIR/key.pem" 2>/dev/null || true
+        chmod 644 "$SSL_DIR/cert.pem" 2>/dev/null || true
+
         nginx -s reload >/dev/null 2>&1 || true
         echo "[Cert] ✅ $DOMAIN 正式证书已生效，已切换为强制域名模式"
-        echo "{"status":"success","msg":"✅ $DOMAIN 证书申请成功，已自动生效；IP 与未绑定域名已禁止访问。"}" > "$RULES_DIR/cert_status.json"
+        echo "{\"status\":\"success\",\"msg\":\"✅ $DOMAIN 证书申请成功，已自动生效；IP 与未绑定域名已禁止访问。\"}" > "$RULES_DIR/cert_status.json"
+        chmod 644 "$RULES_DIR/cert_status.json"
       else
         rm -f "$LOCK_FILE"
         write_allow_file ""
         write_lock_map
         echo "[Cert] ❌ ACME 命令成功但证书校验失败，保持 IP 可访问"
-        echo "{"status":"error","msg":"证书已返回，但未检测到与绑定域名匹配的正式 CA 证书。"}" > "$RULES_DIR/cert_status.json"
+        echo '{"status":"error","msg":"证书已返回，但未检测到与绑定域名匹配的正式 CA 证书。"}' > "$RULES_DIR/cert_status.json"
+        chmod 644 "$RULES_DIR/cert_status.json"
       fi
     else
       rm -f "$LOCK_FILE"
@@ -141,7 +163,8 @@ while true; do
       write_lock_map
       nginx -s reload >/dev/null 2>&1 || true
       echo "[Cert] ❌ $DOMAIN 证书申请失败，保持 IP 可访问模式"
-      echo "{"status":"error","msg":"❌ 申请失败！请确认域名已解析到本机IP、80端口开放且未被 CDN/代理拦截。"}" > "$RULES_DIR/cert_status.json"
+      echo '{"status":"error","msg":"❌ 申请失败！请确认域名已解析到本机IP、80端口开放且未被 CDN/代理拦截。"}' > "$RULES_DIR/cert_status.json"
+      chmod 644 "$RULES_DIR/cert_status.json"
     fi
   fi
 
