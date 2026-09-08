@@ -21,16 +21,16 @@ services:
 
         echo "[Init] Preparing SQLite data directory..."
 
-        mkdir -p "$DATA_DIR"
+        mkdir -p "$$DATA_DIR"
 
         # Application user in php:8.2-fpm-alpine
-        chown -R 82:82 "$DATA_DIR"
+        chown -R 82:82 "$$DATA_DIR"
 
         # Directories: owner/group writable
-        find "$DATA_DIR" -type d -exec chmod 775 {} \;
+        find "$$DATA_DIR" -type d -exec chmod 775 {} \;
 
         # SQLite database and sidecar files
-        find "$DATA_DIR" -type f \
+        find "$$DATA_DIR" -type f \
           \( \
             -name "*.db" \
             -o -name "*.db-wal" \
@@ -47,6 +47,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+
+    image: submonitor-php:latest
 
     container_name: submonitor-php
 
@@ -82,9 +84,7 @@ services:
   # Log importer
   # ---------------------------------------------------------
   log-importer:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: submonitor-php:latest
 
     container_name: submonitor-log-importer
 
@@ -118,9 +118,7 @@ services:
   # Geo worker
   # ---------------------------------------------------------
   geo-worker:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: submonitor-php:latest
 
     container_name: submonitor-geo-worker
 
@@ -193,9 +191,9 @@ services:
       - /bin/sh
       - /entrypoint.sh
 
-  # ---------------------------------------------------------
-  # Persistent Nginx log volume
-  # ---------------------------------------------------------
+# -----------------------------------------------------------
+# Persistent Nginx log volume
+# -----------------------------------------------------------
 volumes:
   log-data:
 
